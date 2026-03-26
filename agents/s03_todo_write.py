@@ -29,6 +29,7 @@ Key insight: "The agent can track its own progress -- and I can see it."
 
 import os
 import subprocess
+from contextlib import contextmanager
 from pathlib import Path
 
 from anthropic import Anthropic
@@ -46,6 +47,51 @@ MODEL = os.environ["MODEL_ID"]
 SYSTEM = f"""You are a coding agent at {WORKDIR}.
 Use the todo tool to plan multi-step tasks. Mark in_progress before starting, completed when done.
 Prefer tools over prose."""
+
+
+def langfuse_enabled() -> bool:
+    return bool(os.getenv("LANGFUSE_PUBLIC_KEY") and os.getenv("LANGFUSE_SECRET_KEY"))
+
+
+def create_langfuse_client():
+    if not langfuse_enabled():
+        return None
+
+    try:
+        from langfuse import Langfuse
+    except ImportError:
+        return None
+
+    kwargs = {
+        "public_key": os.environ["LANGFUSE_PUBLIC_KEY"],
+        "secret_key": os.environ["LANGFUSE_SECRET_KEY"],
+    }
+    if os.getenv("LANGFUSE_HOST"):
+        kwargs["host"] = os.environ["LANGFUSE_HOST"]
+    return Langfuse(**kwargs)
+
+
+LANGFUSE = create_langfuse_client()
+
+
+@contextmanager
+def trace_generation(langfuse_client, span_name: str, trace_input):
+    if not langfuse_client:
+        yield None
+        return
+
+    with langfuse_client.start_as_current_span(
+        name=span_name,
+        input=trace_input,
+        metadata={"agent": "s03_todo_write"},
+    ):
+        with langfuse_client.start_as_current_generation(
+            name="anthropic.messages.create",
+            model=MODEL,
+            input=trace_input,
+        ) as generation:
+            yield generation
+    langfuse_client.flush()
 
 
 # -- TodoManager: structured state the LLM writes to --
@@ -165,10 +211,19 @@ def agent_loop(messages: list):
     rounds_since_todo = 0
     while True:
         # Nag reminder is injected below, alongside tool results
-        response = client.messages.create(
-            model=MODEL, system=SYSTEM, messages=messages,
-            tools=TOOLS, max_tokens=8000,
-        )
+        with trace_generation(LANGFUSE, "s03-user-turn", messages) as generation:
+            response = client.messages.create(
+                model=MODEL, system=SYSTEM, messages=messages,
+                tools=TOOLS, max_tokens=8000,
+            )
+            if generation:
+                generation.update(
+                    output=[
+                        block.text if getattr(block, "type", None) == "text" else {"tool_use": block.name}
+                        for block in response.content
+                    ],
+                    metadata={"stop_reason": response.stop_reason},
+                )
         messages.append({"role": "assistant", "content": response.content})
         if response.stop_reason != "tool_use":
             return
@@ -192,6 +247,8 @@ def agent_loop(messages: list):
 
 
 if __name__ == "__main__":
+    if LANGFUSE:
+        print("Langfuse tracing: enabled")
     history = []
     while True:
         try:

@@ -94,3 +94,17 @@ python agents/s03_todo_write.py
 1. `Refactor the file hello.py: add type hints, docstrings, and a main guard`
 2. `Create a Python package with __init__.py, utils.py, and tests/test_utils.py`
 3. `Review all Python files and fix any style issues`
+
+## Observe It With Langfuse
+
+`agents/s03_todo_write.py` now supports optional Langfuse tracing for this example only. If Langfuse is installed and the keys are present, each user turn creates a trace span plus a generation record around `anthropic.messages.create`.
+
+```sh
+pip install -r requirements.txt
+export LANGFUSE_PUBLIC_KEY=pk-lf-...
+export LANGFUSE_SECRET_KEY=sk-lf-...
+export LANGFUSE_HOST=https://cloud.langfuse.com
+python agents/s03_todo_write.py
+```
+
+When tracing is active, the script prints `Langfuse tracing: enabled` on startup. If the Langfuse package or env vars are missing, the agent runs normally without tracing.

@@ -124,6 +124,8 @@ def agent_loop(messages: list):
         for block in response.content:
             if block.type == "tool_use":
                 handler = TOOL_HANDLERS.get(block.name)
+                if block.name == "bash":
+                    print(f"\033[33m$ {block.input['command']}\033[0m")
                 output = handler(**block.input) if handler else f"Unknown tool: {block.name}"
                 print(f"> {block.name}: {output[:200]}")
                 results.append({"type": "tool_result", "tool_use_id": block.id, "content": output})

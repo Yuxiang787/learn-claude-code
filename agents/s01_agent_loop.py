@@ -26,8 +26,10 @@ policy, hooks, and lifecycle controls on top.
 
 import os
 import subprocess
+from typing import cast
 
 from anthropic import Anthropic
+from anthropic.types import ToolParam
 from dotenv import load_dotenv
 
 load_dotenv(override=True)
@@ -40,15 +42,26 @@ MODEL = os.environ["MODEL_ID"]
 
 SYSTEM = f"You are a coding agent at {os.getcwd()}. Use bash to solve tasks. Act, don't explain."
 
-TOOLS = [{
-    "name": "bash",
-    "description": "Run a shell command.",
-    "input_schema": {
-        "type": "object",
-        "properties": {"command": {"type": "string"}},
-        "required": ["command"],
+TOOLS : list[ToolParam] = [
+    {
+        "name": "bash",
+        "description": "Run a shell command.",
+        "input_schema": {
+            "type": "object",
+            "properties": {"command": {"type": "string"}},
+            "required": ["command"],
+        },
     },
-}]
+    {
+        "name": "get_weather",
+        "description": "Get the weather forecast for a given location.",
+        "input_schema": {
+            "type": "object",
+            "properties": {"location": {"type": "string"}},
+            "required": ["location"],
+        },
+    }
+]
 
 
 def run_bash(command: str) -> str:
@@ -63,6 +76,9 @@ def run_bash(command: str) -> str:
     except subprocess.TimeoutExpired:
         return "Error: Timeout (120s)"
 
+def get_weather(location: str) -> str:
+    # Placeholder implementation - replace with real API call
+    return f"Weather for {location}: Sunny, 25°C"
 
 # -- The core pattern: a while loop that calls tools until the model stops --
 def agent_loop(messages: list):
@@ -80,9 +96,14 @@ def agent_loop(messages: list):
         results = []
         for block in response.content:
             if block.type == "tool_use":
-                print(f"\033[33m$ {block.input['command']}\033[0m")
-                output = run_bash(block.input["command"])
-                print(output[:200])
+                if block.name == "bash":
+                    print(f"\033[33m$ {block.input['command']}\033[0m")
+                    output = run_bash(cast(str, block.input["command"]))
+                    print(output[:200])
+                elif block.name == "get_weather":
+                    print(f"> get_weather: {block.input}")
+                    output = get_weather(block.input["location"])
+                    print(output[:200])
                 results.append({"type": "tool_result", "tool_use_id": block.id,
                                 "content": output})
         messages.append({"role": "user", "content": results})
