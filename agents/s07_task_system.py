@@ -26,9 +26,15 @@ import json
 import os
 import subprocess
 from pathlib import Path
+from typing import Any
 
 from anthropic import Anthropic
 from dotenv import load_dotenv
+
+try:
+    from agents.langfuse_tracing import create_langfuse_client, traced_model_call
+except ModuleNotFoundError:
+    from langfuse_tracing import create_langfuse_client, traced_model_call
 
 load_dotenv(override=True)
 
@@ -39,6 +45,7 @@ WORKDIR = Path.cwd()
 client = Anthropic(base_url=os.getenv("ANTHROPIC_BASE_URL"))
 MODEL = os.environ["MODEL_ID"]
 TASKS_DIR = WORKDIR / ".tasks"
+LANGFUSE = create_langfuse_client()
 
 SYSTEM = f"You are a coding agent at {WORKDIR}. Use task tools to plan and track work."
 
@@ -207,12 +214,30 @@ TOOLS = [
 ]
 
 
-def agent_loop(messages: list):
+def get_langfuse_client() -> Any | None:
+    return LANGFUSE
+
+
+@traced_model_call(
+    get_langfuse_client,
+    model=MODEL,
+    span_name_fn=lambda messages: "s07-user-turn",
+    input_fn=lambda messages: messages,
+    metadata_fn=lambda messages: {"agent": "s07_task_system"},
+)
+def call_model(messages: list[dict[str, Any]]):
+    return client.messages.create(
+        model=MODEL,
+        system=SYSTEM,
+        messages=messages,
+        tools=TOOLS,
+        max_tokens=8000,
+    )
+
+
+def agent_loop(messages: list[dict[str, Any]]):
     while True:
-        response = client.messages.create(
-            model=MODEL, system=SYSTEM, messages=messages,
-            tools=TOOLS, max_tokens=8000,
-        )
+        response = call_model(messages)
         messages.append({"role": "assistant", "content": response.content})
         if response.stop_reason != "tool_use":
             return
@@ -230,6 +255,8 @@ def agent_loop(messages: list):
 
 
 if __name__ == "__main__":
+    if LANGFUSE:
+        print("Langfuse tracing: enabled")
     history = []
     while True:
         try:

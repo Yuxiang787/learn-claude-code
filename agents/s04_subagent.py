@@ -26,9 +26,15 @@ Key insight: "Process isolation gives context isolation for free."
 import os
 import subprocess
 from pathlib import Path
+from typing import Any
 
 from anthropic import Anthropic
 from dotenv import load_dotenv
+
+try:
+    from agents.langfuse_tracing import create_langfuse_client, traced_model_call
+except ModuleNotFoundError:
+    from langfuse_tracing import create_langfuse_client, traced_model_call
 
 load_dotenv(override=True)
 
@@ -36,8 +42,10 @@ if os.getenv("ANTHROPIC_BASE_URL"):
     os.environ.pop("ANTHROPIC_AUTH_TOKEN", None)
 
 WORKDIR = Path.cwd()
-client = Anthropic(base_url=os.getenv("ANTHROPIC_BASE_URL"))
+BASE_URL = os.getenv("ANTHROPIC_BASE_URL")
+client = Anthropic(base_url=BASE_URL)
 MODEL = os.environ["MODEL_ID"]
+LANGFUSE = create_langfuse_client()
 
 SYSTEM = f"You are a coding agent at {WORKDIR}. Use the task tool to delegate exploration or subtasks."
 SUBAGENT_SYSTEM = f"You are a coding subagent at {WORKDIR}. Complete the given task, then summarize your findings."
@@ -62,7 +70,7 @@ def run_bash(command: str) -> str:
     except subprocess.TimeoutExpired:
         return "Error: Timeout (120s)"
 
-def run_read(path: str, limit: int = None) -> str:
+def run_read(path: str, limit: int | None = None) -> str:
     try:
         lines = safe_path(path).read_text().splitlines()
         if limit and limit < len(lines):
@@ -92,7 +100,7 @@ def run_edit(path: str, old_text: str, new_text: str) -> str:
         return f"Error: {e}"
 
 
-TOOL_HANDLERS = {
+TOOL_HANDLERS: dict[str, Any] = {
     "bash":       lambda **kw: run_bash(kw["command"]),
     "read_file":  lambda **kw: run_read(kw["path"], kw.get("limit")),
     "write_file": lambda **kw: run_write(kw["path"], kw["content"]),
@@ -112,14 +120,49 @@ CHILD_TOOLS = [
 ]
 
 
+def get_langfuse_client() -> Any | None:
+    return LANGFUSE
+
+
+@traced_model_call(
+    get_langfuse_client,
+    model=MODEL,
+    span_name_fn=lambda messages: "s04-parent-turn",
+    input_fn=lambda messages: messages,
+    metadata_fn=lambda messages: {"agent": "s04_parent"},
+)
+def call_parent_model(messages: list[dict[str, Any]]):
+    return client.messages.create(
+        model=MODEL,
+        system=SYSTEM,
+        messages=messages,
+        tools=PARENT_TOOLS,
+        max_tokens=8000,
+    )
+
+
+@traced_model_call(
+    get_langfuse_client,
+    model=MODEL,
+    span_name_fn=lambda messages, prompt: f"s04-subagent: {prompt}",
+    input_fn=lambda messages, prompt: messages,
+    metadata_fn=lambda messages, prompt: {"agent": "s04_subagent", "prompt": prompt},
+)
+def call_subagent_model(messages: list[dict[str, Any]], prompt: str):
+    return client.messages.create(
+        model=MODEL,
+        system=SUBAGENT_SYSTEM,
+        messages=messages,
+        tools=CHILD_TOOLS,
+        max_tokens=8000,
+    )
+
+
 # -- Subagent: fresh context, filtered tools, summary-only return --
 def run_subagent(prompt: str) -> str:
     sub_messages = [{"role": "user", "content": prompt}]  # fresh context
     for _ in range(30):  # safety limit
-        response = client.messages.create(
-            model=MODEL, system=SUBAGENT_SYSTEM, messages=sub_messages,
-            tools=CHILD_TOOLS, max_tokens=8000,
-        )
+        response = call_subagent_model(sub_messages, prompt)
         sub_messages.append({"role": "assistant", "content": response.content})
         if response.stop_reason != "tool_use":
             break
@@ -140,13 +183,9 @@ PARENT_TOOLS = CHILD_TOOLS + [
      "input_schema": {"type": "object", "properties": {"prompt": {"type": "string"}, "description": {"type": "string", "description": "Short description of the task"}}, "required": ["prompt"]}},
 ]
 
-
-def agent_loop(messages: list):
+def agent_loop(messages: list[dict[str, Any]]) -> None:
     while True:
-        response = client.messages.create(
-            model=MODEL, system=SYSTEM, messages=messages,
-            tools=PARENT_TOOLS, max_tokens=8000,
-        )
+        response = call_parent_model(messages)
         messages.append({"role": "assistant", "content": response.content})
         if response.stop_reason != "tool_use":
             return
@@ -155,17 +194,19 @@ def agent_loop(messages: list):
             if block.type == "tool_use":
                 if block.name == "task":
                     desc = block.input.get("description", "subtask")
-                    print(f"> task ({desc}): {block.input['prompt'][:80]}")
+                    print(f"> task ({desc}): {block.input['prompt'][:800]}")
                     output = run_subagent(block.input["prompt"])
                 else:
                     handler = TOOL_HANDLERS.get(block.name)
                     output = handler(**block.input) if handler else f"Unknown tool: {block.name}"
-                print(f"  {str(output)[:200]}")
+                print(f"  {str(output)[:1000]}")
                 results.append({"type": "tool_result", "tool_use_id": block.id, "content": str(output)})
         messages.append({"role": "user", "content": results})
 
 
 if __name__ == "__main__":
+    if LANGFUSE:
+        print("Langfuse tracing: enabled")
     history = []
     while True:
         try:

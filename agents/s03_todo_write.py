@@ -31,6 +31,7 @@ import os
 import subprocess
 from contextlib import contextmanager
 from pathlib import Path
+from typing import Any, Iterator
 
 from anthropic import Anthropic
 from dotenv import load_dotenv
@@ -41,7 +42,8 @@ if os.getenv("ANTHROPIC_BASE_URL"):
     os.environ.pop("ANTHROPIC_AUTH_TOKEN", None)
 
 WORKDIR = Path.cwd()
-client = Anthropic(base_url=os.getenv("ANTHROPIC_BASE_URL"))
+BASE_URL = os.getenv("ANTHROPIC_BASE_URL")
+client = Anthropic(base_url=BASE_URL)
 MODEL = os.environ["MODEL_ID"]
 
 SYSTEM = f"""You are a coding agent at {WORKDIR}.
@@ -53,7 +55,7 @@ def langfuse_enabled() -> bool:
     return bool(os.getenv("LANGFUSE_PUBLIC_KEY") and os.getenv("LANGFUSE_SECRET_KEY"))
 
 
-def create_langfuse_client():
+def create_langfuse_client() -> Any | None:
     if not langfuse_enabled():
         return None
 
@@ -62,31 +64,74 @@ def create_langfuse_client():
     except ImportError:
         return None
 
-    kwargs = {
+    kwargs: dict[str, str] = {
         "public_key": os.environ["LANGFUSE_PUBLIC_KEY"],
         "secret_key": os.environ["LANGFUSE_SECRET_KEY"],
     }
-    if os.getenv("LANGFUSE_HOST"):
-        kwargs["host"] = os.environ["LANGFUSE_HOST"]
-    return Langfuse(**kwargs)
+    langfuse_host = os.getenv("LANGFUSE_HOST")
+    if langfuse_host:
+        kwargs["host"] = langfuse_host
+    return Langfuse(**kwargs) # type: ignore
 
 
 LANGFUSE = create_langfuse_client()
 
 
+def start_langfuse_observation(
+    langfuse_client: Any,
+    name: str,
+    *,
+    as_type: str = "span",
+    **kwargs: Any,
+) -> Any:
+    if hasattr(langfuse_client, "start_as_current_observation"):
+        return langfuse_client.start_as_current_observation(name=name, as_type=as_type, **kwargs)
+
+    if as_type == "generation" and hasattr(langfuse_client, "start_as_current_generation"):
+        return langfuse_client.start_as_current_generation(name=name, **kwargs)
+
+    if as_type == "span" and hasattr(langfuse_client, "start_as_current_span"):
+        return langfuse_client.start_as_current_span(name=name, **kwargs)
+
+    raise AttributeError(f"Unsupported Langfuse client API for observation type: {as_type}")
+
+
+def serialize_response_blocks(blocks: list[Any]) -> list[Any]:
+    output: list[Any] = []
+    for block in blocks:
+        block_type = getattr(block, "type", None)
+        if block_type == "text":
+            output.append(block.text)
+        elif block_type == "tool_use":
+            output.append({"tool_use": block.name})
+        elif block_type == "thinking":
+            output.append({"thinking": getattr(block, "thinking", "")})
+        else:
+            output.append({"type": block_type or "unknown"})
+    return output
+
+
 @contextmanager
-def trace_generation(langfuse_client, span_name: str, trace_input):
+def trace_generation(
+    langfuse_client: Any,
+    span_name: str,
+    trace_input: list[Any],
+) -> Iterator[Any | None]:
     if not langfuse_client:
         yield None
         return
 
-    with langfuse_client.start_as_current_span(
+    with start_langfuse_observation(
+        langfuse_client,
         name=span_name,
+        as_type="span",
         input=trace_input,
         metadata={"agent": "s03_todo_write"},
     ):
-        with langfuse_client.start_as_current_generation(
+        with start_langfuse_observation(
+            langfuse_client,
             name="anthropic.messages.create",
+            as_type="generation",
             model=MODEL,
             input=trace_input,
         ) as generation:
@@ -96,13 +141,13 @@ def trace_generation(langfuse_client, span_name: str, trace_input):
 
 # -- TodoManager: structured state the LLM writes to --
 class TodoManager:
-    def __init__(self):
-        self.items = []
+    def __init__(self) -> None:
+        self.items: list[dict[str, str]] = []
 
-    def update(self, items: list) -> str:
+    def update(self, items: list[dict[str, Any]]) -> str:
         if len(items) > 20:
             raise ValueError("Max 20 todos allowed")
-        validated = []
+        validated: list[dict[str, str]] = []
         in_progress_count = 0
         for i, item in enumerate(items):
             text = str(item.get("text", "")).strip()
@@ -123,7 +168,7 @@ class TodoManager:
     def render(self) -> str:
         if not self.items:
             return "No todos."
-        lines = []
+        lines: list[str] = []
         for item in self.items:
             marker = {"pending": "[ ]", "in_progress": "[>]", "completed": "[x]"}[item["status"]]
             lines.append(f"{marker} #{item['id']}: {item['text']}")
@@ -154,7 +199,7 @@ def run_bash(command: str) -> str:
     except subprocess.TimeoutExpired:
         return "Error: Timeout (120s)"
 
-def run_read(path: str, limit: int = None) -> str:
+def run_read(path: str, limit: int | None = None) -> str:
     try:
         lines = safe_path(path).read_text().splitlines()
         if limit and limit < len(lines):
@@ -184,7 +229,7 @@ def run_edit(path: str, old_text: str, new_text: str) -> str:
         return f"Error: {e}"
 
 
-TOOL_HANDLERS = {
+TOOL_HANDLERS: dict[str, Any] = {
     "bash":       lambda **kw: run_bash(kw["command"]),
     "read_file":  lambda **kw: run_read(kw["path"], kw.get("limit")),
     "write_file": lambda **kw: run_write(kw["path"], kw["content"]),
@@ -207,7 +252,7 @@ TOOLS = [
 
 
 # -- Agent loop with nag reminder injection --
-def agent_loop(messages: list):
+def agent_loop(messages: list[Any]) -> None:
     rounds_since_todo = 0
     while True:
         # Nag reminder is injected below, alongside tool results
@@ -218,16 +263,13 @@ def agent_loop(messages: list):
             )
             if generation:
                 generation.update(
-                    output=[
-                        block.text if getattr(block, "type", None) == "text" else {"tool_use": block.name}
-                        for block in response.content
-                    ],
+                    output=serialize_response_blocks(response.content),
                     metadata={"stop_reason": response.stop_reason},
                 )
         messages.append({"role": "assistant", "content": response.content})
         if response.stop_reason != "tool_use":
             return
-        results = []
+        results: list[dict[str, str]] = []
         used_todo = False
         for block in response.content:
             if block.type == "tool_use":
@@ -249,7 +291,7 @@ def agent_loop(messages: list):
 if __name__ == "__main__":
     if LANGFUSE:
         print("Langfuse tracing: enabled")
-    history = []
+    history: list[dict[str, Any]] = []
     while True:
         try:
             query = input("\033[36ms03 >> \033[0m")

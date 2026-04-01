@@ -45,9 +45,15 @@ import time
 import uuid
 from pathlib import Path
 from queue import Queue
+from typing import Any
 
 from anthropic import Anthropic
 from dotenv import load_dotenv
+
+try:
+    from agents.langfuse_tracing import create_langfuse_client, traced_model_call
+except ModuleNotFoundError:
+    from langfuse_tracing import create_langfuse_client, traced_model_call
 
 load_dotenv(override=True)
 if os.getenv("ANTHROPIC_BASE_URL"):
@@ -56,6 +62,7 @@ if os.getenv("ANTHROPIC_BASE_URL"):
 WORKDIR = Path.cwd()
 client = Anthropic(base_url=os.getenv("ANTHROPIC_BASE_URL"))
 MODEL = os.environ["MODEL_ID"]
+LANGFUSE = create_langfuse_client()
 
 TEAM_DIR = WORKDIR / ".team"
 INBOX_DIR = TEAM_DIR / "inbox"
@@ -68,6 +75,10 @@ IDLE_TIMEOUT = 60
 
 VALID_MSG_TYPES = {"message", "broadcast", "shutdown_request",
                    "shutdown_response", "plan_approval_response"}
+
+
+def get_langfuse_client() -> Any | None:
+    return LANGFUSE
 
 
 # === SECTION: base_tools ===
@@ -180,7 +191,7 @@ def run_subagent(prompt: str, agent_type: str = "Explore") -> str:
     sub_msgs = [{"role": "user", "content": prompt}]
     resp = None
     for _ in range(30):
-        resp = client.messages.create(model=MODEL, messages=sub_msgs, tools=sub_tools, max_tokens=8000)
+        resp = call_subagent_model(sub_msgs, sub_tools, agent_type)
         sub_msgs.append({"role": "assistant", "content": resp.content})
         if resp.stop_reason != "tool_use":
             break
@@ -247,11 +258,7 @@ def auto_compact(messages: list) -> list:
         for msg in messages:
             f.write(json.dumps(msg, default=str) + "\n")
     conv_text = json.dumps(messages, default=str)[:80000]
-    resp = client.messages.create(
-        model=MODEL,
-        messages=[{"role": "user", "content": f"Summarize for continuity:\n{conv_text}"}],
-        max_tokens=2000,
-    )
+    resp = call_compactor_model(conv_text)
     summary = resp.content[0].text
     return [
         {"role": "user", "content": f"[Compressed. Transcript: {path}]\n{summary}"},
@@ -463,9 +470,7 @@ class TeammateManager:
                         return
                     messages.append({"role": "user", "content": json.dumps(msg)})
                 try:
-                    response = client.messages.create(
-                        model=MODEL, system=sys_prompt, messages=messages,
-                        tools=tools, max_tokens=8000)
+                    response = call_teammate_model(messages, sys_prompt, tools, name)
                 except Exception:
                     self._set_status(name, "shutdown")
                     return
@@ -555,6 +560,69 @@ SYSTEM = f"""You are a coding agent at {WORKDIR}. Use tools to solve tasks.
 Prefer task_create/task_update/task_list for multi-step work. Use TodoWrite for short checklists.
 Use task for subagent delegation. Use load_skill for specialized knowledge.
 Skills: {SKILLS.descriptions()}"""
+
+
+@traced_model_call(
+    get_langfuse_client,
+    model=MODEL,
+    span_name_fn=lambda messages, sub_tools, agent_type: f"s_full-subagent:{agent_type}",
+    input_fn=lambda messages, sub_tools, agent_type: messages,
+    metadata_fn=lambda messages, sub_tools, agent_type: {
+        "agent": "s_full_subagent",
+        "agent_type": agent_type,
+    },
+)
+def call_subagent_model(
+    messages: list[dict[str, Any]],
+    sub_tools: list[dict[str, Any]],
+    agent_type: str,
+):
+    return client.messages.create(
+        model=MODEL,
+        messages=messages,
+        tools=sub_tools,
+        max_tokens=8000,
+    )
+
+
+@traced_model_call(
+    get_langfuse_client,
+    model=MODEL,
+    span_name_fn=lambda conv_text: "s_full-auto-compact",
+    input_fn=lambda conv_text: [{"role": "user", "content": f"Summarize for continuity:\n{conv_text}"}],
+    metadata_fn=lambda conv_text: {"agent": "s_full_compactor"},
+)
+def call_compactor_model(conv_text: str):
+    return client.messages.create(
+        model=MODEL,
+        messages=[{"role": "user", "content": f"Summarize for continuity:\n{conv_text}"}],
+        max_tokens=2000,
+    )
+
+
+@traced_model_call(
+    get_langfuse_client,
+    model=MODEL,
+    span_name_fn=lambda messages, sys_prompt, tools, name: f"s_full-teammate:{name}",
+    input_fn=lambda messages, sys_prompt, tools, name: messages,
+    metadata_fn=lambda messages, sys_prompt, tools, name: {
+        "agent": "s_full_teammate",
+        "teammate": name,
+    },
+)
+def call_teammate_model(
+    messages: list[dict[str, Any]],
+    sys_prompt: str,
+    tools: list[dict[str, Any]],
+    name: str,
+):
+    return client.messages.create(
+        model=MODEL,
+        system=sys_prompt,
+        messages=messages,
+        tools=tools,
+        max_tokens=8000,
+    )
 
 
 # === SECTION: shutdown_protocol (s10) ===
@@ -652,7 +720,24 @@ TOOLS = [
 
 
 # === SECTION: agent_loop ===
-def agent_loop(messages: list):
+@traced_model_call(
+    get_langfuse_client,
+    model=MODEL,
+    span_name_fn=lambda messages: "s_full-user-turn",
+    input_fn=lambda messages: messages,
+    metadata_fn=lambda messages: {"agent": "s_full"},
+)
+def call_main_model(messages: list[dict[str, Any]]):
+    return client.messages.create(
+        model=MODEL,
+        system=SYSTEM,
+        messages=messages,
+        tools=TOOLS,
+        max_tokens=8000,
+    )
+
+
+def agent_loop(messages: list[dict[str, Any]]):
     rounds_without_todo = 0
     while True:
         # s06: compression pipeline
@@ -672,10 +757,7 @@ def agent_loop(messages: list):
             messages.append({"role": "user", "content": f"<inbox>{json.dumps(inbox, indent=2)}</inbox>"})
             messages.append({"role": "assistant", "content": "Noted inbox messages."})
         # LLM call
-        response = client.messages.create(
-            model=MODEL, system=SYSTEM, messages=messages,
-            tools=TOOLS, max_tokens=8000,
-        )
+        response = call_main_model(messages)
         messages.append({"role": "assistant", "content": response.content})
         if response.stop_reason != "tool_use":
             return
@@ -709,6 +791,8 @@ def agent_loop(messages: list):
 
 # === SECTION: repl ===
 if __name__ == "__main__":
+    if LANGFUSE:
+        print("Langfuse tracing: enabled")
     history = []
     while True:
         try:

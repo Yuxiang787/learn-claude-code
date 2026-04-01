@@ -42,9 +42,15 @@ import threading
 import time
 import uuid
 from pathlib import Path
+from typing import Any
 
 from anthropic import Anthropic
 from dotenv import load_dotenv
+
+try:
+    from agents.langfuse_tracing import create_langfuse_client, traced_model_call
+except ModuleNotFoundError:
+    from langfuse_tracing import create_langfuse_client, traced_model_call
 
 load_dotenv(override=True)
 if os.getenv("ANTHROPIC_BASE_URL"):
@@ -56,6 +62,7 @@ MODEL = os.environ["MODEL_ID"]
 TEAM_DIR = WORKDIR / ".team"
 INBOX_DIR = TEAM_DIR / "inbox"
 TASKS_DIR = WORKDIR / ".tasks"
+LANGFUSE = create_langfuse_client()
 
 POLL_INTERVAL = 5
 IDLE_TIMEOUT = 60
@@ -121,6 +128,35 @@ class MessageBus:
 
 
 BUS = MessageBus(INBOX_DIR)
+
+
+def get_langfuse_client() -> Any | None:
+    return LANGFUSE
+
+
+@traced_model_call(
+    get_langfuse_client,
+    model=MODEL,
+    span_name_fn=lambda messages, sys_prompt, tools, name: f"s11-teammate:{name}",
+    input_fn=lambda messages, sys_prompt, tools, name: messages,
+    metadata_fn=lambda messages, sys_prompt, tools, name: {
+        "agent": "s11_teammate",
+        "teammate": name,
+    },
+)
+def call_teammate_model(
+    messages: list[dict[str, Any]],
+    sys_prompt: str,
+    tools: list[dict[str, Any]],
+    name: str,
+):
+    return client.messages.create(
+        model=MODEL,
+        system=sys_prompt,
+        messages=messages,
+        tools=tools,
+        max_tokens=8000,
+    )
 
 
 # -- Task board scanning --
@@ -224,13 +260,7 @@ class TeammateManager:
                         return
                     messages.append({"role": "user", "content": json.dumps(msg)})
                 try:
-                    response = client.messages.create(
-                        model=MODEL,
-                        system=sys_prompt,
-                        messages=messages,
-                        tools=tools,
-                        max_tokens=8000,
-                    )
+                    response = call_teammate_model(messages, sys_prompt, tools, name)
                 except Exception:
                     self._set_status(name, "idle")
                     return
@@ -507,7 +537,24 @@ TOOLS = [
 ]
 
 
-def agent_loop(messages: list):
+@traced_model_call(
+    get_langfuse_client,
+    model=MODEL,
+    span_name_fn=lambda messages: "s11-lead-turn",
+    input_fn=lambda messages: messages,
+    metadata_fn=lambda messages: {"agent": "s11_lead"},
+)
+def call_lead_model(messages: list[dict[str, Any]]):
+    return client.messages.create(
+        model=MODEL,
+        system=SYSTEM,
+        messages=messages,
+        tools=TOOLS,
+        max_tokens=8000,
+    )
+
+
+def agent_loop(messages: list[dict[str, Any]]):
     while True:
         inbox = BUS.read_inbox("lead")
         if inbox:
@@ -519,13 +566,7 @@ def agent_loop(messages: list):
                 "role": "assistant",
                 "content": "Noted inbox messages.",
             })
-        response = client.messages.create(
-            model=MODEL,
-            system=SYSTEM,
-            messages=messages,
-            tools=TOOLS,
-            max_tokens=8000,
-        )
+        response = call_lead_model(messages)
         messages.append({"role": "assistant", "content": response.content})
         if response.stop_reason != "tool_use":
             return
@@ -547,6 +588,8 @@ def agent_loop(messages: list):
 
 
 if __name__ == "__main__":
+    if LANGFUSE:
+        print("Langfuse tracing: enabled")
     history = []
     while True:
         try:

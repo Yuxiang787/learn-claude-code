@@ -30,9 +30,15 @@ import subprocess
 import threading
 import uuid
 from pathlib import Path
+from typing import Any
 
 from anthropic import Anthropic
 from dotenv import load_dotenv
+
+try:
+    from agents.langfuse_tracing import create_langfuse_client, traced_model_call
+except ModuleNotFoundError:
+    from langfuse_tracing import create_langfuse_client, traced_model_call
 
 load_dotenv(override=True)
 
@@ -42,6 +48,7 @@ if os.getenv("ANTHROPIC_BASE_URL"):
 WORKDIR = Path.cwd()
 client = Anthropic(base_url=os.getenv("ANTHROPIC_BASE_URL"))
 MODEL = os.environ["MODEL_ID"]
+LANGFUSE = create_langfuse_client()
 
 SYSTEM = f"You are a coding agent at {WORKDIR}. Use background_run for long-running commands."
 
@@ -185,7 +192,28 @@ TOOLS = [
 ]
 
 
-def agent_loop(messages: list):
+def get_langfuse_client() -> Any | None:
+    return LANGFUSE
+
+
+@traced_model_call(
+    get_langfuse_client,
+    model=MODEL,
+    span_name_fn=lambda messages: "s08-user-turn",
+    input_fn=lambda messages: messages,
+    metadata_fn=lambda messages: {"agent": "s08_background_tasks"},
+)
+def call_model(messages: list[dict[str, Any]]):
+    return client.messages.create(
+        model=MODEL,
+        system=SYSTEM,
+        messages=messages,
+        tools=TOOLS,
+        max_tokens=8000,
+    )
+
+
+def agent_loop(messages: list[dict[str, Any]]):
     while True:
         # Drain background notifications and inject as system message before LLM call
         notifs = BG.drain_notifications()
@@ -195,10 +223,7 @@ def agent_loop(messages: list):
             )
             messages.append({"role": "user", "content": f"<background-results>\n{notif_text}\n</background-results>"})
             messages.append({"role": "assistant", "content": "Noted background results."})
-        response = client.messages.create(
-            model=MODEL, system=SYSTEM, messages=messages,
-            tools=TOOLS, max_tokens=8000,
-        )
+        response = call_model(messages)
         messages.append({"role": "assistant", "content": response.content})
         if response.stop_reason != "tool_use":
             return
@@ -216,6 +241,8 @@ def agent_loop(messages: list):
 
 
 if __name__ == "__main__":
+    if LANGFUSE:
+        print("Langfuse tracing: enabled")
     history = []
     while True:
         try:

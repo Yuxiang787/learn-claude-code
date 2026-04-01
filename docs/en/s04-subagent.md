@@ -92,3 +92,17 @@ python agents/s04_subagent.py
 1. `Use a subtask to find what testing framework this project uses`
 2. `Delegate: read all .py files and summarize what each one does`
 3. `Use a task to create a new module, then verify it from here`
+
+## Observe It With Langfuse
+
+`agents/s04_subagent.py` now supports optional Langfuse tracing for both the parent agent and each spawned subagent. If Langfuse is installed and the keys are present, every `anthropic.messages.create` call is traced through a small decorator-based helper layer.
+
+```sh
+pip install -r requirements.txt
+export LANGFUSE_PUBLIC_KEY=pk-lf-...
+export LANGFUSE_SECRET_KEY=sk-lf-...
+export LANGFUSE_HOST=https://cloud.langfuse.com
+python agents/s04_subagent.py
+```
+
+When tracing is active, the script prints `Langfuse tracing: enabled` on startup. If the Langfuse package or env vars are missing, the agent still runs normally without tracing.

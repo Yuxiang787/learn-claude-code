@@ -39,9 +39,15 @@ import os
 import subprocess
 import time
 from pathlib import Path
+from typing import Any
 
 from anthropic import Anthropic
 from dotenv import load_dotenv
+
+try:
+    from agents.langfuse_tracing import create_langfuse_client, traced_model_call
+except ModuleNotFoundError:
+    from langfuse_tracing import create_langfuse_client, traced_model_call
 
 load_dotenv(override=True)
 
@@ -51,6 +57,7 @@ if os.getenv("ANTHROPIC_BASE_URL"):
 WORKDIR = Path.cwd()
 client = Anthropic(base_url=os.getenv("ANTHROPIC_BASE_URL"))
 MODEL = os.environ["MODEL_ID"]
+LANGFUSE = create_langfuse_client()
 
 SYSTEM = f"You are a coding agent at {WORKDIR}. Use tools to solve tasks."
 
@@ -105,14 +112,7 @@ def auto_compact(messages: list) -> list:
     print(f"[transcript saved: {transcript_path}]")
     # Ask LLM to summarize
     conversation_text = json.dumps(messages, default=str)[:80000]
-    response = client.messages.create(
-        model=MODEL,
-        messages=[{"role": "user", "content":
-            "Summarize this conversation for continuity. Include: "
-            "1) What was accomplished, 2) Current state, 3) Key decisions made. "
-            "Be concise but preserve critical details.\n\n" + conversation_text}],
-        max_tokens=2000,
-    )
+    response = call_compactor_model(conversation_text)
     summary = response.content[0].text
     # Replace all messages with compressed summary
     return [
@@ -192,7 +192,53 @@ TOOLS = [
 ]
 
 
-def agent_loop(messages: list):
+def get_langfuse_client() -> Any | None:
+    return LANGFUSE
+
+
+@traced_model_call(
+    get_langfuse_client,
+    model=MODEL,
+    span_name_fn=lambda conversation_text: "s06-auto-compact",
+    input_fn=lambda conversation_text: [{
+        "role": "user",
+        "content": (
+            "Summarize this conversation for continuity. Include: "
+            "1) What was accomplished, 2) Current state, 3) Key decisions made. "
+            "Be concise but preserve critical details.\n\n" + conversation_text
+        ),
+    }],
+    metadata_fn=lambda conversation_text: {"agent": "s06_compactor"},
+)
+def call_compactor_model(conversation_text: str):
+    return client.messages.create(
+        model=MODEL,
+        messages=[{"role": "user", "content":
+            "Summarize this conversation for continuity. Include: "
+            "1) What was accomplished, 2) Current state, 3) Key decisions made. "
+            "Be concise but preserve critical details.\n\n" + conversation_text}],
+        max_tokens=2000,
+    )
+
+
+@traced_model_call(
+    get_langfuse_client,
+    model=MODEL,
+    span_name_fn=lambda messages: "s06-user-turn",
+    input_fn=lambda messages: messages,
+    metadata_fn=lambda messages: {"agent": "s06_context_compact"},
+)
+def call_model(messages: list[dict[str, Any]]):
+    return client.messages.create(
+        model=MODEL,
+        system=SYSTEM,
+        messages=messages,
+        tools=TOOLS,
+        max_tokens=8000,
+    )
+
+
+def agent_loop(messages: list[dict[str, Any]]):
     while True:
         # Layer 1: micro_compact before each LLM call
         micro_compact(messages)
@@ -200,10 +246,7 @@ def agent_loop(messages: list):
         if estimate_tokens(messages) > THRESHOLD:
             print("[auto_compact triggered]")
             messages[:] = auto_compact(messages)
-        response = client.messages.create(
-            model=MODEL, system=SYSTEM, messages=messages,
-            tools=TOOLS, max_tokens=8000,
-        )
+        response = call_model(messages)
         messages.append({"role": "assistant", "content": response.content})
         if response.stop_reason != "tool_use":
             return
@@ -230,6 +273,8 @@ def agent_loop(messages: list):
 
 
 if __name__ == "__main__":
+    if LANGFUSE:
+        print("Langfuse tracing: enabled")
     history = []
     while True:
         try:

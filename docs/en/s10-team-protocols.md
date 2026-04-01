@@ -10,10 +10,10 @@
 
 In s09, teammates work and communicate but lack structured coordination:
 
-**Shutdown**: Killing a thread leaves files half-written and config.json stale. You need a handshake: the lead requests, the teammate approves (finish and exit) or rejects (keep working).
+**Shutdown**: Killing a thread leaves files half-written and config.json stale. You need a handshake: the lead requests, the teammate approves (finish and exit) or rejects (keep working).V
 
 **Plan approval**: When the lead says "refactor the auth module," the teammate starts immediately. For high-risk changes, the lead should review the plan first.
-
+V
 Both share the same structure: one side sends a request with a unique ID, the other responds referencing that ID.
 
 ## Solution

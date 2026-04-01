@@ -1,0 +1,4 @@
+{"event": "worktree.create.before", "ts": 1775050991.423868, "task": {"id": 1}, "worktree": {"name": "auth-refactor", "base_ref": "HEAD"}}
+{"event": "worktree.create.after", "ts": 1775050991.5384371, "task": {"id": 1}, "worktree": {"name": "auth-refactor", "path": "/Users/slumber/Downloads/learn-claude-code/.worktrees/auth-refactor", "branch": "wt/auth-refactor", "status": "active"}}
+{"event": "worktree.create.before", "ts": 1775050991.538653, "task": {"id": 2}, "worktree": {"name": "ui-login", "base_ref": "HEAD"}}
+{"event": "worktree.create.after", "ts": 1775050991.596664, "task": {"id": 2}, "worktree": {"name": "ui-login", "path": "/Users/slumber/Downloads/learn-claude-code/.worktrees/ui-login", "branch": "wt/ui-login", "status": "active"}}

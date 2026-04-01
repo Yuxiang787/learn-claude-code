@@ -1,0 +1,25 @@
+{
+  "team_name": "default",
+  "members": [
+    {
+      "name": "alice",
+      "role": "coder",
+      "status": "shutdown"
+    },
+    {
+      "name": "bob",
+      "role": "tester",
+      "status": "idle"
+    },
+    {
+      "name": "Socrates_bot",
+      "role": "Philosopher - Dualist perspective",
+      "status": "working"
+    },
+    {
+      "name": "Neuro_Ninja",
+      "role": "Philosopher - Physicalist perspective",
+      "status": "idle"
+    }
+  ]
+}

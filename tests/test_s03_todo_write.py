@@ -59,6 +59,18 @@ class FakeLangfuseClient:
         self.flush_called = True
 
 
+class FakeLangfuseClientV3:
+    def __init__(self):
+        self.observations = []
+        self.flush_called = False
+
+    def start_as_current_observation(self, name, *, as_type="span", **kwargs):
+        return FakeObservation(self.observations, as_type, name, kwargs)
+
+    def flush(self):
+        self.flush_called = True
+
+
 @contextmanager
 def temp_env(**updates):
     old = {key: os.environ.get(key) for key in updates}
@@ -85,9 +97,8 @@ class LangfuseHelpersTest(unittest.TestCase):
             LANGFUSE_HOST=None,
         ):
             mod = load_module()
-
-        self.assertFalse(mod.langfuse_enabled())
-        self.assertIsNone(mod.create_langfuse_client())
+            self.assertFalse(mod.langfuse_enabled())
+            self.assertIsNone(mod.create_langfuse_client())
 
     def test_langfuse_client_uses_env_when_available(self):
         fake_langfuse_module = types.SimpleNamespace(Langfuse=lambda **kwargs: kwargs)
@@ -111,13 +122,14 @@ class LangfuseHelpersTest(unittest.TestCase):
         )
 
     def test_trace_generation_records_input_output_and_flushes(self):
-        mod = load_module()
-        fake_client = FakeLangfuseClient()
-        trace_input = [{"role": "user", "content": "Write a todo list"}]
-        response_text = "Done."
+        with temp_env(MODEL_ID="test-model"):
+            mod = load_module()
+            fake_client = FakeLangfuseClient()
+            trace_input = [{"role": "user", "content": "Write a todo list"}]
+            response_text = "Done."
 
-        with mod.trace_generation(fake_client, "s03-turn", trace_input) as generation:
-            generation.update(output=response_text, metadata={"stop_reason": "end_turn"})
+            with mod.trace_generation(fake_client, "s03-turn", trace_input) as generation:
+                generation.update(output=response_text, metadata={"stop_reason": "end_turn"})
 
         self.assertEqual(len(fake_client.observations), 2)
         span, generation = fake_client.observations
@@ -129,6 +141,44 @@ class LangfuseHelpersTest(unittest.TestCase):
         self.assertEqual(generation.kwargs["model"], "test-model")
         self.assertEqual(generation.updated[-1]["output"], response_text)
         self.assertTrue(fake_client.flush_called)
+
+    def test_trace_generation_supports_langfuse_v3_observation_api(self):
+        with temp_env(MODEL_ID="test-model"):
+            mod = load_module()
+            fake_client = FakeLangfuseClientV3()
+            trace_input = [{"role": "user", "content": "Write a todo list"}]
+            response_text = "Done."
+
+            with mod.trace_generation(fake_client, "s03-turn", trace_input) as generation:
+                generation.update(output=response_text, metadata={"stop_reason": "end_turn"})
+
+        self.assertEqual(len(fake_client.observations), 2)
+        span, generation = fake_client.observations
+        self.assertEqual(span.kind, "span")
+        self.assertEqual(span.name, "s03-turn")
+        self.assertEqual(span.kwargs["input"], trace_input)
+        self.assertEqual(generation.kind, "generation")
+        self.assertEqual(generation.name, "anthropic.messages.create")
+        self.assertEqual(generation.kwargs["model"], "test-model")
+        self.assertEqual(generation.updated[-1]["output"], response_text)
+        self.assertTrue(fake_client.flush_called)
+
+    def test_serialize_response_blocks_handles_thinking_blocks(self):
+        mod = load_module()
+        blocks = [
+            types.SimpleNamespace(type="thinking", thinking="Need a plan"),
+            types.SimpleNamespace(type="text", text="I can help with that."),
+            types.SimpleNamespace(type="tool_use", name="todo"),
+        ]
+
+        self.assertEqual(
+            mod.serialize_response_blocks(blocks),
+            [
+                {"thinking": "Need a plan"},
+                "I can help with that.",
+                {"tool_use": "todo"},
+            ],
+        )
 
 
 if __name__ == "__main__":
